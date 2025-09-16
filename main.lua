@@ -35,7 +35,7 @@ local scriptState = {
     statusText = 'Idle',
     lastAction = '',
     debug = false,
-    pull = {state = 'idle', targetID = nil, startTime = 0, phantomUsed = false},
+    pull = {state = 'idle', targetID = nil, startTime = 0, phantomUsed = false, usingNav = false},
     chChain = {nextCast = 0, casting = false, lastTick = 0},
     timers = {},
 }
@@ -1014,6 +1014,11 @@ end
 
 local function pullReturnToCamp(profile)
     if not profile.camp.anchor then return end
+    if scriptState.pull.usingNav then
+        mq.cmd('/nav stop')
+        mq.cmd('/nav clear')
+        scriptState.pull.usingNav = false
+    end
     mq.cmdf('/nav locxyz %d %d %d', profile.camp.anchor.x, profile.camp.anchor.y, profile.camp.anchor.z)
 end
 
@@ -1032,11 +1037,18 @@ local function runPuller(profile)
             state.targetID = target.ID()
             state.startTime = now()
             state.phantomUsed = false
+            state.usingNav = false
             updatePullStatus('pulling', state.targetID)
             mq.cmdf('/target id %d', target.ID())
             mq.delay(50)
             usePhantomShadow(profile)
-            mq.cmd('/stick 60 behind')
+            local navCommand = profile.pull.navCommand
+            if type(navCommand) == 'string' and navCommand:match('%S') then
+                mq.cmdf(navCommand, target.ID())
+                state.usingNav = true
+            else
+                mq.cmd('/stick 60 behind')
+            end
             mq.cmd('/attack on')
             scriptState.statusText = string.format('Pulling %s', target.CleanName())
         end
@@ -1068,13 +1080,17 @@ local function runPuller(profile)
             if dist <= (profile.camp.radius or 40) then
                 mq.cmd('/attack off')
                 mq.cmd('/stick off')
+                mq.cmd('/nav stop')
+                mq.cmd('/nav clear')
                 state.state = 'idle'
                 state.targetID = nil
+                state.usingNav = false
                 updatePullStatus('idle', 0)
                 scriptState.statusText = 'Pull complete'
             end
         else
             state.state = 'idle'
+            state.usingNav = false
             updatePullStatus('idle', 0)
         end
     end
