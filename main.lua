@@ -38,6 +38,7 @@ local scriptState = {
     pull = {state = 'idle', targetID = nil, startTime = 0, phantomUsed = false, usingNav = false},
     chChain = {nextCast = 0, casting = false, lastTick = 0},
     timers = {},
+    charm = {},
 }
 
 local function now()
@@ -427,6 +428,10 @@ local function bardDefaults(profile)
         breakHP = 25,
         rebreak = true,
         mezOnBreak = true,
+        mezzSpell = '',
+        mezzGem = 1,
+        recharmDelay = 2.0,
+        suppressSeconds = 6.0,
     }
 end
 
@@ -440,6 +445,9 @@ local function enchanterDefaults(profile)
         rebreak = true,
         mezzSpell = 'Color Conflux',
         mezzGem = 2,
+        mezOnBreak = true,
+        recharmDelay = 2.0,
+        suppressSeconds = 6.0,
     }
 end
 
@@ -451,6 +459,11 @@ local function necromancerDefaults(profile)
         targetFilter = 'npc radius 80 undead',
         breakHP = 35,
         rebreak = true,
+        mezzSpell = '',
+        mezzGem = 1,
+        mezOnBreak = false,
+        recharmDelay = 2.5,
+        suppressSeconds = 6.0,
     }
 end
 
@@ -682,25 +695,23 @@ local function handleCharm(profile)
     if not charm or not charm.enabled then
         return
     end
-    local pet = mq.TLO.Me.Pet
-    if pet() and pet.ID() > 0 then
-        if pet.Buff('Charm')() then
-            return
-        end
-        if pet.PctHPs() and pet.PctHPs() < (charm.breakHP or 25) then
-            mq.cmd('/pet back off')
-        end
-        return
+
+    local state = scriptState.charm
+    if not state then
+        state = {}
+        scriptState.charm = state
     end
-    local target
-    if charm.targetFilter and charm.targetFilter ~= '' then
-        target = mq.TLO.NearestSpawn(charm.targetFilter)
-    else
-        target = mq.TLO.Target
+    state.ignoreTargets = state.ignoreTargets or {}
+
+    local currentTime = now()
+    for id, expiry in pairs(state.ignoreTargets) do
+        if expiry and currentTime >= expiry then
+            state.ignoreTargets[id] = nil
+        end
     end
-    if target() then
-        mq.cmdf('/target id %d', target.ID())
-        mq.delay(200)
+
+    local function castCharmSpell()
+        if not charm.spell or charm.spell == '' then return false end
         local entry = {
             type = 'Spell',
             name = charm.spell,
@@ -709,6 +720,154 @@ local function handleCharm(profile)
             condition = charm.condition or '',
         }
         processEntry(entry, profile, {Target = mq.TLO.Target})
+        scriptState.lastAction = string.format('Charm: %s', charm.spell)
+        return true
+    end
+
+    local function castMezSpell()
+        if not charm.mezzSpell or charm.mezzSpell == '' then return false end
+        local entry = {
+            type = 'Spell',
+            name = charm.mezzSpell,
+            gem = charm.mezzGem or 1,
+            target = 'current',
+            condition = charm.mezCondition or '',
+        }
+        processEntry(entry, profile, {Target = mq.TLO.Target})
+        scriptState.lastAction = string.format('Mez: %s', charm.mezzSpell)
+        return true
+    end
+
+    local breakHP = charm.breakHP or 25
+    local rebreak = charm.rebreak ~= false
+    local cooldownMs = math.floor(math.max(charm.recharmDelay or 2.0, 0) * 1000)
+    local suppressMs = math.floor(math.max(charm.suppressSeconds or 6.0, 0) * 1000)
+    local postMezMs = 1500
+
+    state.nextCharmAt = state.nextCharmAt or 0
+
+    local pet = mq.TLO.Me.Pet
+    local petID = pet() and pet.ID() or nil
+    if petID and petID > 0 then
+        state.hadPet = true
+        state.lastPetID = petID
+        local hp = pet.PctHPs() or 100
+        state.lastPetHP = hp
+        if state.pendingRecharm then
+            state.pendingRecharm = false
+            state.pendingMez = false
+            state.pendingRecharmStart = nil
+        end
+        if hp and hp > 0 and hp < breakHP then
+            if not state.lastBackoff or currentTime - state.lastBackoff > 750 then
+                mq.cmd('/pet back off')
+                state.lastBackoff = currentTime
+            end
+        end
+        return
+    end
+
+    if state.hadPet then
+        state.hadPet = false
+        if state.lastPetID and rebreak and not state.ignoreTargets[state.lastPetID] then
+            state.pendingRecharm = true
+            state.pendingRecharmStart = currentTime
+            if charm.mezOnBreak and charm.mezzSpell and charm.mezzSpell ~= '' then
+                state.pendingMez = true
+                state.nextMezAt = currentTime
+            else
+                state.pendingMez = false
+            end
+        else
+            state.pendingRecharm = false
+            state.pendingMez = false
+            state.pendingRecharmStart = nil
+        end
+    end
+
+    if state.pendingRecharm and state.lastPetID then
+        if suppressMs > 0 and state.pendingRecharmStart and currentTime - state.pendingRecharmStart > suppressMs then
+            state.ignoreTargets[state.lastPetID] = currentTime + suppressMs
+            state.pendingRecharm = false
+            state.pendingMez = false
+            state.pendingRecharmStart = nil
+        else
+            local spawn = mq.TLO.Spawn(string.format('id %d', state.lastPetID))
+            if not spawn() or spawn.Dead() or spawn.Type() == 'Corpse' then
+                state.ignoreTargets[state.lastPetID] = currentTime + suppressMs
+                state.pendingRecharm = false
+                state.pendingMez = false
+                state.pendingRecharmStart = nil
+                state.lastPetID = nil
+            else
+                if mq.TLO.Target.ID() ~= state.lastPetID then
+                    mq.cmdf('/target id %d', state.lastPetID)
+                    mq.delay(100)
+                end
+                if state.pendingMez then
+                    if currentTime >= (state.nextMezAt or 0) and not mq.TLO.Me.Casting() then
+                        if castMezSpell() then
+                            local after = now()
+                            state.nextCharmAt = math.max(state.nextCharmAt or 0, after + postMezMs)
+                            state.lastMezAt = after
+                        end
+                        state.pendingMez = false
+                    end
+                    return
+                end
+                if mq.TLO.Me.Casting() then
+                    return
+                end
+                if currentTime < state.nextCharmAt then
+                    return
+                end
+                if castCharmSpell() then
+                    local attempt = now()
+                    state.lastCharmAttempt = attempt
+                    state.nextCharmAt = attempt + cooldownMs
+                end
+                return
+            end
+        end
+    end
+
+    if currentTime < state.nextCharmAt then
+        return
+    end
+
+    local target = mq.TLO.Target
+    local manualTarget = target() and target.Type() ~= 'Corpse'
+    if manualTarget then
+        if state.ignoreTargets[target.ID()] and currentTime < state.ignoreTargets[target.ID()] then
+            manualTarget = false
+            target = nil
+        end
+    else
+        target = nil
+    end
+    if not target and charm.targetFilter and charm.targetFilter ~= '' then
+        local candidate = mq.TLO.NearestSpawn(charm.targetFilter)
+        if candidate() and candidate.Type() ~= 'Corpse' then
+            if not state.ignoreTargets[candidate.ID()] or currentTime >= state.ignoreTargets[candidate.ID()] then
+                target = candidate
+            end
+        end
+    end
+    if not target or not target() then
+        return
+    end
+    if mq.TLO.Target.ID() ~= target.ID() then
+        mq.cmdf('/target id %d', target.ID())
+        mq.delay(100)
+    end
+    if mq.TLO.Me.Casting() then
+        return
+    end
+    if castCharmSpell() then
+        local attempt = now()
+        state.lastCharmAttempt = attempt
+        state.nextCharmAt = attempt + cooldownMs
+        state.lastPetID = target.ID()
     end
 end
 
@@ -1416,8 +1575,52 @@ local function renderPullSettings(profile)
     end
 end
 
+local function renderCharmSettings(profile)
+    local specials = profile.specials or {}
+    local charm = specials.charm
+    if not charm then return false end
+    ImGui.Separator()
+    ImGui.Text('Charm Control')
+    local changed
+    changed, charm.enabled = ImGui.Checkbox('Enable Charm', charm.enabled)
+    changed, charm.spell = ImGui.InputText('Charm Spell', charm.spell or '')
+    local gem = charm.gem or 1
+    changed, gem = ImGui.InputInt('Charm Gem', gem)
+    if changed then charm.gem = gem end
+    changed, charm.targetFilter = ImGui.InputText('Target Filter', charm.targetFilter or '')
+    local breakHP = charm.breakHP or 25
+    changed, breakHP = ImGui.InputFloat('Break HP %', breakHP)
+    if changed then
+        if breakHP < 0 then breakHP = 0 end
+        if breakHP > 100 then breakHP = 100 end
+        charm.breakHP = breakHP
+    end
+    local rebreak = charm.rebreak ~= false
+    changed, rebreak = ImGui.Checkbox('Recharm on Break', rebreak)
+    if changed then charm.rebreak = rebreak end
+    local delay = charm.recharmDelay or 2.0
+    changed, delay = ImGui.InputFloat('Recharm Cooldown (s)', delay)
+    if changed then charm.recharmDelay = math.max(delay, 0) end
+    local suppress = charm.suppressSeconds or 6.0
+    changed, suppress = ImGui.InputFloat('Suppress After Release (s)', suppress)
+    if changed then charm.suppressSeconds = math.max(suppress, 0) end
+    local mezOnBreak = charm.mezOnBreak or false
+    changed, mezOnBreak = ImGui.Checkbox('Mez on Break', mezOnBreak)
+    if changed then charm.mezOnBreak = mezOnBreak end
+    changed, charm.mezzSpell = ImGui.InputText('Mez Spell', charm.mezzSpell or '')
+    local mezzGem = charm.mezzGem or 1
+    changed, mezzGem = ImGui.InputInt('Mez Gem', mezzGem)
+    if changed then charm.mezzGem = math.max(mezzGem, 1) end
+    changed, charm.condition = ImGui.InputText('Charm Condition', charm.condition or '')
+    return true
+end
+
 local function renderSpecialSettings(profile)
     if ImGui.TreeNode('Special Class Features') then
+        local hadContent = false
+        if renderCharmSettings(profile) then
+            hadContent = true
+        end
         if classShort == 'SHM' then
             local cann = profile.specials.cannibalize or {enabled = false}
             profile.specials.cannibalize = cann
@@ -1432,6 +1635,7 @@ local function renderSpecialSettings(profile)
             changed, hp = ImGui.InputFloat('Keep HP Above %', hp)
             if changed then cann.minHP = hp end
             changed, cann.announce = ImGui.Checkbox('Announce', cann.announce or false)
+            hadContent = true
         elseif classShort == 'PAL' then
             local loh = profile.specials.layHands or {enabled = false}
             profile.specials.layHands = loh
@@ -1443,6 +1647,7 @@ local function renderSpecialSettings(profile)
             if changed then loh.threshold = threshold end
             changed, loh.command = ImGui.InputText('Command', loh.command or '/alt activate 2000')
             changed, loh.announce = ImGui.InputText('Announce', loh.announce or '')
+            hadContent = true
         elseif classShort == 'ROG' then
             local sa = profile.specials.sneakAttack or {enabled = false}
             profile.specials.sneakAttack = sa
@@ -1453,6 +1658,7 @@ local function renderSpecialSettings(profile)
             local cd = sa.cooldown or 12
             changed, cd = ImGui.InputFloat('Cooldown', cd)
             if changed then sa.cooldown = cd end
+            hadContent = true
         elseif classShort == 'CLR' then
             local chain = profile.specials.chChain or {enabled = false}
             profile.specials.chChain = chain
@@ -1470,7 +1676,9 @@ local function renderSpecialSettings(profile)
             if changed then chain.chainSize = size end
             changed, chain.channel = ImGui.InputText('Announce Channel', chain.channel or '/rs')
             changed, chain.message = ImGui.InputText('Announce Message', chain.message or 'CH %s (#%d/%d)')
-        else
+            hadContent = true
+        end
+        if not hadContent then
             ImGui.Text('No special configuration for this class yet.')
         end
         ImGui.TreePop()
