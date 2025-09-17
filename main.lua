@@ -600,22 +600,54 @@ local function canUse(entry)
 end
 
 local function targetByConfig(target)
-    if not target or target == '' or target == 'self' then
+    if not target or target == '' then
         return
     end
-    if target == 'maintank' then
-        local mt = mq.TLO.Group.MainTank()
-        if mt() then mq.cmdf('/target %s', mt()) end
-    elseif target == 'mainassist' then
-        local ma = mq.TLO.Group.MainAssist()
-        if ma() then mq.cmdf('/assist %s', ma()) end
-    elseif target == 'xtar1' then
-        mq.cmd('/xtar 1')
-    elseif target:sub(1,5) == 'name:' then
-        mq.cmdf('/target %s', target:sub(6))
-    else
-        mq.cmdf('/target %s', target)
+
+    local lowered = target:lower()
+    if lowered == 'self' or lowered == 'current' or lowered == 'target' then
+        return
     end
+
+    if lowered == 'none' or lowered == 'clear' then
+        mq.cmd('/target clear')
+        return
+    end
+
+    if lowered == 'maintank' then
+        local mt = mq.TLO.Group.MainTank
+        if mt and mt() and mt() ~= '' then
+            mq.cmdf('/target %s', mt())
+        end
+        return
+    end
+
+    if lowered == 'mainassist' then
+        local ma = mq.TLO.Group.MainAssist
+        if ma and ma() and ma() ~= '' then
+            mq.cmdf('/assist %s', ma())
+        end
+        return
+    end
+
+    local xtarSlot = target:match('^[Xx][Tt][Aa][Rr](%d+)$')
+    if xtarSlot then
+        local slotNum = tonumber(xtarSlot)
+        if slotNum then
+            mq.cmdf('/xtar %d', slotNum)
+        end
+        return
+    end
+
+    if target:sub(1, 5):lower() == 'name:' then
+        local name = target:sub(6):gsub('^%s+', ''):gsub('%s+$', '')
+        if name ~= '' then
+            mq.cmdf('/target "%s"', name)
+        end
+        return
+    end
+
+    mq.cmdf('/target %s', target)
 end
 
 local function executeEntry(entry, profile)
@@ -931,11 +963,11 @@ local function resolveTargetString(target)
         return charName
     end
     if target == 'maintank' then
-        local mt = mq.TLO.Group.MainTank()
-        return mt() or charName
+        local mt = mq.TLO.Group.MainTank
+        return (mt and mt() and mt() ~= '' and mt()) or charName
     elseif target == 'mainassist' then
-        local ma = mq.TLO.Group.MainAssist()
-        return ma() or charName
+        local ma = mq.TLO.Group.MainAssist
+        return (ma and ma() and ma() ~= '' and ma()) or charName
     else
         return target
     end
@@ -948,13 +980,18 @@ local function handleLayHands(profile)
     end
     local targetName = resolveTargetString(loh.target)
     if not targetName then return end
+
     local hp
     if targetName == charName then
         hp = mq.TLO.Me.PctHPs()
     else
-        hp = mq.TLO.Spawn(string.format('pc %s', targetName)).PctHPs()
+        local spawn = mq.TLO.Spawn(string.format('pc %s', targetName))
+        if spawn() then
+            hp = spawn.PctHPs()
+        end
     end
-    if hp and hp() and hp() <= (loh.threshold or 25) then
+
+    if hp and hp <= (loh.threshold or 25) then
         mq.cmdf('/target %s', targetName)
         mq.delay(50)
         if loh.command and loh.command ~= '' then
@@ -1210,7 +1247,8 @@ local function runPuller(profile)
     if not profile.pull.enabled then return end
     if classShort ~= 'MNK' then return end
     if mq.TLO.Me.CombatState() == 'COMBAT' then return end
-    if mq.TLO.Me.XTarget() >= (profile.pull.maxActive or 2) then return end
+    local xtargetCount = tonumber(mq.TLO.Me.XTarget() or 0)
+    if xtargetCount >= (profile.pull.maxActive or 2) then return end
     if otherMonkPulling() then return end
 
     local state = scriptState.pull
@@ -1243,7 +1281,8 @@ local function runPuller(profile)
                 mq.delay(20)
             end
         end
-        if mq.TLO.Me.XTarget() > 1 and (mq.TLO.Me.PctHPs() or 100) < (profile.pull.feignPctHP or 35) then
+        local currentXT = tonumber(mq.TLO.Me.XTarget() or 0)
+        if currentXT > 1 and (mq.TLO.Me.PctHPs() or 100) < (profile.pull.feignPctHP or 35) then
             feignDeath(profile)
         end
         if profile.camp.anchor then
@@ -1419,8 +1458,8 @@ local function assistTarget(profile)
             mq.cmdf('/xtar %d', slot)
             attemptedAssist = true
         elseif assist.mode == 'mainassist' then
-            local ma = mq.TLO.Group.MainAssist()
-            if ma() then
+            local ma = mq.TLO.Group.MainAssist
+            if ma and ma() and ma() ~= '' then
                 mq.cmdf('/assist %s', ma())
                 attemptedAssist = true
             end
@@ -1498,15 +1537,17 @@ local function runHeals(profile)
             local spawn = mq.TLO.Spawn(string.format('pc %s', heal.target or ''))
             local hp
             if heal.target == 'maintank' then
-                local mt = mq.TLO.Group.MainTank()
-                if mt() then spawn = mq.TLO.Spawn(string.format('pc %s', mt())) end
+                local mt = mq.TLO.Group.MainTank
+                if mt and mt() and mt() ~= '' then
+                    spawn = mq.TLO.Spawn(string.format('pc %s', mt()))
+                end
             elseif heal.target and heal.target ~= '' then
                 spawn = mq.TLO.Spawn(string.format('pc %s', heal.target))
             end
             if spawn() then
                 hp = spawn.PctHPs()
             end
-            if hp and hp() and hp() <= (heal.threshold or 60) then
+            if hp and hp <= (heal.threshold or 60) then
                 local targetName = heal.target or 'unknown'
                 if spawn() then
                     targetName = spawn.CleanName() or targetName
