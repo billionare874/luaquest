@@ -38,7 +38,7 @@ local scriptState = {
     pull = {state = 'idle', targetID = nil, startTime = 0, phantomUsed = false, usingNav = false},
     chChain = {nextCast = 0, casting = false, lastTick = 0},
     timers = {},
-    charm = {},
+
 }
 
 local function now()
@@ -284,7 +284,16 @@ local function baseProfile()
             heals = true,
             utility = true,
             specials = true,
-            assist = {enabled = true, mode = 'manual', target = '', stick = true, stickDist = 10},
+            assist = {
+                enabled = true,
+                mode = 'manual',
+                target = '',
+                xtarSlot = 1,
+                stick = true,
+                stickDist = 10,
+                stickMode = 'behind',
+                stickBreakOnTargetLoss = true,
+            },
             restMana = 70,
             restEndurance = 30,
             restHP = 80,
@@ -352,6 +361,19 @@ local function mergeTable(base, extra)
             end
         else
             base[k] = v
+        end
+    end
+end
+
+local function applyDefaults(target, defaults)
+    for key, value in pairs(defaults) do
+        if type(value) == 'table' then
+            if type(target[key]) ~= 'table' then
+                target[key] = {}
+            end
+            applyDefaults(target[key], value)
+        elseif target[key] == nil then
+            target[key] = value
         end
     end
 end
@@ -496,11 +518,14 @@ local config = {
 }
 
 local function ensureProfile()
+    local defaults = baseProfile()
     if not config.classes[classShort] then
-        config.classes[classShort] = baseProfile()
+        config.classes[classShort] = defaults
         if classDefaultFns[classShort] then
             classDefaultFns[classShort](config.classes[classShort])
         end
+    else
+        applyDefaults(config.classes[classShort], defaults)
     end
     return config.classes[classShort]
 end
@@ -1284,19 +1309,129 @@ local function runBuffs(profile)
     end
 end
 
+local function stickPluginActive()
+    local stick = mq.TLO.Stick
+    if not stick or not stick.Active then return nil end
+    local ok, value = pcall(function() return stick.Active() end)
+    if not ok then return nil end
+    if type(value) == 'string' then
+        local lowered = value:lower()
+        if lowered == 'true' or lowered == 'on' then return true end
+        if lowered == 'false' or lowered == 'off' then return false end
+        local number = tonumber(lowered)
+        if number ~= nil then return number ~= 0 end
+        return lowered ~= ''
+    elseif type(value) == 'number' then
+        return value ~= 0
+    end
+    return not not value
+end
+
+local function clearStick()
+    if scriptState.stick.active or stickPluginActive() then
+        mq.cmd('/stick off')
+    end
+    scriptState.stick.active = false
+    scriptState.stick.targetID = 0
+end
+
+local function issueStickCommand(assist, targetID)
+    local distance = tonumber(assist.stickDist) or 10
+    if distance < 0 then distance = 0 end
+    distance = math.floor(distance + 0.5)
+    if distance < 1 then distance = 1 end
+    local mode = (assist.stickMode or 'behind'):lower()
+    if mode == 'hold' then
+        mq.cmdf('/stick hold %d', distance)
+    elseif mode == 'front' then
+        mq.cmdf('/stick %d front', distance)
+    else
+        mq.cmdf('/stick %d behind', distance)
+    end
+    scriptState.stick.active = true
+    scriptState.stick.targetID = targetID
+end
+
+local function updateAssistStick(assist, targetID)
+    assist = assist or {}
+    local stickEnabled = assist.stick ~= false
+    local breakOnLoss = assist.stickBreakOnTargetLoss ~= false
+
+    local pluginActive = stickPluginActive()
+    if pluginActive == false and scriptState.stick.active then
+        scriptState.stick.active = false
+        scriptState.stick.targetID = 0
+    end
+
+    if not stickEnabled then
+        if scriptState.stick.active or pluginActive then
+            clearStick()
+        end
+        return
+    end
+
+    if not targetID or targetID == 0 then
+        if breakOnLoss then
+            clearStick()
+        end
+        return
+    end
+
+    if scriptState.stick.targetID ~= targetID or not scriptState.stick.active then
+        if scriptState.stick.active then
+            clearStick()
+        end
+        issueStickCommand(assist, targetID)
+        return
+    end
+
+    if pluginActive then
+        scriptState.stick.active = true
+        scriptState.stick.targetID = targetID
+    end
+end
+
+local function currentTargetID()
+    local target = mq.TLO.Target
+    if not target then return 0 end
+    local id = target.ID and target.ID() or 0
+    if not id or id == 0 then return 0 end
+    if target.Type and target.Type() == 'Corpse' then return 0 end
+    return id
+end
+
 local function assistTarget(profile)
     local assist = profile.general.assist or {}
-    if not assist.enabled then return end
-    if mq.TLO.Target.ID() and mq.TLO.Target.Type() ~= 'Corpse' then return end
-    if assist.mode == 'manual' and assist.target and assist.target ~= '' then
-        mq.cmdf('/assist %s', assist.target)
-    elseif assist.mode == 'xtar' then
-        local slot = assist.xtarSlot or 1
-        mq.cmdf('/xtar %d', slot)
-    elseif assist.mode == 'mainassist' then
-        local ma = mq.TLO.Group.MainAssist()
-        if ma() then mq.cmdf('/assist %s', ma()) end
+    if not assist.enabled then
+        updateAssistStick(assist, 0)
+        return
     end
+
+    local targetID = currentTargetID()
+    local attemptedAssist = false
+    if targetID == 0 then
+        if assist.mode == 'manual' and assist.target and assist.target ~= '' then
+            mq.cmdf('/assist %s', assist.target)
+            attemptedAssist = true
+        elseif assist.mode == 'xtar' then
+            local slot = tonumber(assist.xtarSlot) or 1
+            slot = math.max(1, math.floor(slot))
+            mq.cmdf('/xtar %d', slot)
+            attemptedAssist = true
+        elseif assist.mode == 'mainassist' then
+            local ma = mq.TLO.Group.MainAssist()
+            if ma() then
+                mq.cmdf('/assist %s', ma())
+                attemptedAssist = true
+            end
+        end
+        if attemptedAssist then
+            mq.delay(50)
+            targetID = currentTargetID()
+        end
+    end
+
+    updateAssistStick(assist, targetID)
 end
 
 local function runDPS(profile)
@@ -1452,9 +1587,19 @@ end
 --------------------------------------------------------------------------------
 local abilityTypes = {'Spell', 'AA', 'Disc', 'Item', 'Command', 'Ability'}
 
+local assistModes = {'manual', 'xtar', 'mainassist'}
+local stickModes = {'behind', 'front', 'hold'}
+
 local function typeIndex(current)
     for i, v in ipairs(abilityTypes) do
         if v == current then return i end
+    end
+    return 1
+end
+
+local function listIndex(list, value)
+    for i, v in ipairs(list) do
+        if v == value then return i end
     end
     return 1
 end
@@ -1707,6 +1852,40 @@ local function renderGeneralSettings(profile)
         changed, toggles.heals = ImGui.Checkbox('Heals', toggles.heals)
         changed, toggles.utility = ImGui.Checkbox('Utility', toggles.utility)
         changed, toggles.specials = ImGui.Checkbox('Specials', toggles.specials)
+        ImGui.TreePop()
+    end
+    if ImGui.TreeNode('Assist Settings') then
+        local assist = profile.general.assist or {}
+        profile.general.assist = assist
+        local changed
+        local assistEnabled = assist.enabled ~= false
+        changed, assistEnabled = ImGui.Checkbox('Assist Enabled', assistEnabled)
+        if changed then assist.enabled = assistEnabled end
+        local currentMode = listIndex(assistModes, assist.mode or 'manual') - 1
+        changed, currentMode = ImGui.Combo('Assist Mode', currentMode, assistModes, #assistModes)
+        if changed then assist.mode = assistModes[currentMode + 1] end
+        if assist.mode == 'manual' then
+            changed, assist.target = ImGui.InputText('Assist Target', assist.target or '')
+        elseif assist.mode == 'xtar' then
+            local slot = assist.xtarSlot or 1
+            changed, slot = ImGui.InputInt('XTarget Slot', slot)
+            if changed then assist.xtarSlot = math.max(1, math.floor(slot)) end
+        end
+        local stickEnabled = assist.stick ~= false
+        changed, stickEnabled = ImGui.Checkbox('Use Stick', stickEnabled)
+        if changed then assist.stick = stickEnabled end
+        local distance = assist.stickDist or 10
+        changed, distance = ImGui.InputFloat('Stick Distance', distance)
+        if changed then
+            if distance < 0 then distance = 0 end
+            assist.stickDist = distance
+        end
+        local currentStickMode = listIndex(stickModes, (assist.stickMode or 'behind')) - 1
+        changed, currentStickMode = ImGui.Combo('Stick Mode', currentStickMode, stickModes, #stickModes)
+        if changed then assist.stickMode = stickModes[currentStickMode + 1] end
+        local breakStick = assist.stickBreakOnTargetLoss ~= false
+        changed, breakStick = ImGui.Checkbox('Break Stick Without Target', breakStick)
+        if changed then assist.stickBreakOnTargetLoss = breakStick end
         ImGui.TreePop()
     end
 end
