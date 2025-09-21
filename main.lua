@@ -49,7 +49,12 @@ local function now()
 end
 
 local function printf(level, msg, ...)
-    mq.printf('\aw[AIO]\ax [\ag%s\ax] %s', level, string.format(msg, ...))
+    local formatted = string.format(msg, ...)
+    if mq and mq.printf then
+        mq.printf('\aw[AIO]\ax [\ag%s\ax] %s', level, formatted)
+    else
+        print(string.format('[AIO] [%s] %s', level, formatted))
+    end
 end
 
 local configDir = mq.configDir or mq.TLO.MacroQuest.Path.Config()
